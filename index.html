@@ -24,8 +24,8 @@
 
 // ============================================================
 // CONTRAST — single-file browser prototype
-// Continuous optical tuning -> interference intensity -> collision state.
-// Visual language is intentionally monochrome: phase relationship changes brightness, not hue.
+// Continuous cyclic phase tuning -> interference intensity -> collision state.
+// Visual language is intentionally monochrome: only BRIGHT/DARK are extrema; GRAY means in-between TUNING.
 // ============================================================
 
 const canvas = document.getElementById('game');
@@ -50,9 +50,11 @@ let audioReady = false;
 let lastGrounded = false;
 let tuneDir = 0;
 
-// Lens / Newton Rings continuation. The exact player wavelength is captured at the chamber.
+// Lens / Newton Rings continuation. The player's current RELATIVE PHASE is captured at the chamber.
+// The optical source wavelength itself stays fixed for the Newton-ring measurement stage.
+const SOURCE_LAMBDA = 550;
 let lensTransitionTimer = 0;
-let sampleLambda = 532;
+let samplePhase = Math.PI/2;
 let sampleIntensity = 0.5;
 let measurementIntroTimer = 0;
 let measurementResultTimer = 0;
@@ -84,7 +86,7 @@ const CFG = {
   maxFall:1050,
   coyote:0.10,
   jumpBuffer:0.12,
-  tuneSpeed:150,          // faster sweep: ~1.33 s from 450 nm to 650 nm
+  phaseSpeed:2.75,        // rad/s; half-cycle BRIGHT -> DARK takes ~1.14 s, and tuning loops forever
 };
 
 const player = {
@@ -94,15 +96,15 @@ const player = {
   groundedOn:null,
   coyote:0,
   jumpBuffer:0,
-  lambda:532,
+  phase:Math.PI/2,
   intensity:0.5,
-  state:'MEDIUM',
+  state:'TUNING',
   facing:1,
   ghost:new Set(),
   trail:[],
   respawnX:150,
   respawnFeet:780,
-  respawnLambda:532,
+  respawnPhase:Math.PI/2,
 };
 
 const camera = { x:0, y:235, zoom:1, targetZoom:1 };
@@ -161,9 +163,9 @@ function setupEasyLevel(){
   add('LENS_CHAMBER_FLOOR', MAT.GRAY,4520,700,1080,100);
 
   checkpoints = [
-    { id:0, x:150,  feet:780, lambda:532, triggerX:-1 },
-    { id:1, x:1260, feet:780, lambda:532, triggerX:1220 },
-    { id:2, x:3020, feet:700, lambda:450, triggerX:2960 },
+    { id:0, x:150,  feet:780, phase:Math.PI/2, triggerX:-1 }, // TUNING: safe on BLACK floor
+    { id:1, x:1260, feet:780, phase:Math.PI/2, triggerX:1220 },
+    { id:2, x:3020, feet:700, phase:0, triggerX:2960 },       // BRIGHT: ready for WHITE gate
   ];
 }
 
@@ -189,8 +191,10 @@ function setupHardLevel(){
   add('BLACK_SHUTTER_C', MAT.BLACK,2736,230,58,430);
   add('EXIT_PLATFORM_03', MAT.GRAY,2794,620,500,55);
 
-  add('CONTRAST_APPROACH', MAT.GRAY,3230,620,430,55);
-  add('WHITE_MEMBRANE', MAT.WHITE,3600,260,70,360);
+  // Eased further: give the player a clearer ledge after the white membrane.
+  // This lets them stabilize before the next phase change without killing the hard level's core idea.
+  add('CONTRAST_APPROACH', MAT.GRAY,3230,620,560,55);
+  add('WHITE_MEMBRANE', MAT.WHITE,3570,260,70,360);
   add('BLACK_MEMBRANE', MAT.BLACK,3860,250,70,410);
   add('BLACK_LANDING', MAT.BLACK,3930,660,630,70);
 
@@ -202,10 +206,10 @@ function setupHardLevel(){
   hardPortal = { x:5372, y:205, w:46, h:95 };
 
   checkpoints = [
-    { id:0, x:150, feet:780, lambda:532, triggerX:-1 },
-    { id:1, x:1280, feet:780, lambda:550, triggerX:1245 },
-    { id:2, x:3280, feet:620, lambda:475, triggerX:3220 },
-    { id:3, x:4440, feet:660, lambda:532, triggerX:4410 },
+    { id:0, x:150, feet:780, phase:Math.PI/2, triggerX:-1 },
+    { id:1, x:1280, feet:780, phase:Math.PI/2, triggerX:1245 },
+    { id:2, x:3280, feet:620, phase:0, triggerX:3220 },       // BRIGHT keeps GRAY platform solid
+    { id:3, x:4440, feet:660, phase:Math.PI/2, triggerX:4410 },
   ];
 }
 
@@ -223,27 +227,30 @@ const lerp = (a,b,t) => a+(b-a)*t;
 const approach = (v,target,amount) => v < target ? Math.min(target,v+amount) : Math.max(target,v-amount);
 const smooth = (rate,dt) => 1-Math.exp(-rate*dt);
 
-function intensityFor(lambda) {
-  const deltaL = 731.25;
-  const phi0 = 0.75*Math.PI;
-  const phase = (2*Math.PI*deltaL/lambda)+phi0;
+const TAU = Math.PI*2;
+function wrapPhase(phi){
+  phi %= TAU;
+  return phi < 0 ? phi + TAU : phi;
+}
+function intensityForPhase(phase) {
   return clamp((1+Math.cos(phase))/2,0,1);
 }
 function stateFor(I) {
   if (I >= 0.78) return 'BRIGHT';
   if (I <= 0.22) return 'DARK';
-  if (I >= 0.40 && I <= 0.60) return 'MEDIUM';
-  return 'TRANSITION';
+  return 'TUNING';
 }
 function matches(material, I=player.intensity) {
   if (material===MAT.WHITE) return I>=0.78;
-  if (material===MAT.GRAY) return I>=0.40 && I<=0.60;
-  return I<=0.22;
+  if (material===MAT.BLACK) return I<=0.22;
+  // GRAY is no longer a third stable state. It represents the continuous tuning regions between extrema.
+  return I>0.22 && I<0.78;
 }
 function reactStrength(material,I=player.intensity) {
   if (material===MAT.WHITE) return clamp((I-0.62)/(0.78-0.62),0,1);
-  if (material===MAT.GRAY) return clamp((0.18-Math.abs(I-0.50))/(0.18-0.10),0,1);
-  return clamp((0.38-I)/(0.38-0.22),0,1);
+  if (material===MAT.BLACK) return clamp((0.38-I)/(0.38-0.22),0,1);
+  // Gray reacts throughout the in-between tuning band, with a short visual lead-in near each boundary.
+  return clamp(Math.min((I-0.16)/0.06,(0.84-I)/0.06),0,1);
 }
 function grayForIntensity(I, alpha=1, min=18, max=245) {
   const v=Math.round(lerp(min,max,clamp(I,0,1)));
@@ -252,8 +259,7 @@ function grayForIntensity(I, alpha=1, min=18, max=245) {
 function stateVisual(state=player.state){
   if(state==='BRIGHT') return {label:'BRIGHT', relation:'IN PHASE', fill:'#f4f7f8', text:'#071019', edge:'#ffffff'};
   if(state==='DARK') return {label:'DARK', relation:'OPPOSITE PHASE', fill:'#0a0e13', text:'#eef3f6', edge:'#b8c2c9'};
-  if(state==='MEDIUM') return {label:'MEDIUM', relation:'PARTIAL INTERFERENCE', fill:'#737b83', text:'#ffffff', edge:'#d7dde1'};
-  return {label:'TUNING', relation:'BETWEEN STATES', fill:'#30373e', text:'#f2f5f7', edge:'#aeb7be'};
+  return {label:'TUNING', relation:'PHASE SHIFTING', fill:'#596168', text:'#ffffff', edge:'#d1d8dc'};
 }
 
 // ------------------------------------------------------------
@@ -294,7 +300,7 @@ canvas.addEventListener('pointerdown', e => {
   const sx=(e.clientX-r.left)*V.w/r.width, sy=(e.clientY-r.top)*V.h/r.height;
 
   // Always-visible back button while inside a level / measurement flow.
-  if(gameState!=='LEVEL_SELECT' && sx>=26&&sx<=166&&sy>=24&&sy<=68){
+  if(gameState!=='LEVEL_SELECT' && sx>=V.w-166&&sx<=V.w-26&&sy>=24&&sy<=68){
     goToLevelSelect();
     return;
   }
@@ -449,7 +455,7 @@ function setCheckpoint(index){
   if(index<=activeCheckpoint) return;
   activeCheckpoint=index;
   const cp=checkpoints[index];
-  player.respawnX=cp.x; player.respawnFeet=cp.feet; player.respawnLambda=cp.lambda;
+  player.respawnX=cp.x; player.respawnFeet=cp.feet; player.respawnPhase=cp.phase;
   checkpointFlash=1; screenPulse=.45; checkpointSound();
 }
 function updateCheckpoint(){
@@ -463,14 +469,14 @@ function die(){
 }
 function respawn(){
   const cp=checkpoints[activeCheckpoint];
-  player.x=cp.x; player.y=cp.feet-player.h; player.vx=0; player.vy=0; player.lambda=cp.lambda;
-  player.intensity=intensityFor(player.lambda); player.state=stateFor(player.intensity);
+  player.x=cp.x; player.y=cp.feet-player.h; player.vx=0; player.vy=0; player.phase=wrapPhase(cp.phase);
+  player.intensity=intensityForPhase(player.phase); player.state=stateFor(player.intensity);
   player.ghost.clear(); player.trail.length=0; player.grounded=false; player.groundedOn=null;
   gameState='PLAY'; deathTimer=0; screenPulse=.25;
 }
 function beginLensTransition(){
   if(gameState!=='PLAY') return;
-  sampleLambda=player.lambda;
+  samplePhase=wrapPhase(player.phase);
   sampleIntensity=player.intensity;
   lensTransitionTimer=0;
   player.vx=0; player.vy=0; player.jumpBuffer=0; player.coyote=0;
@@ -479,8 +485,8 @@ function beginLensTransition(){
   screenPulse=.35;
   ping(360,.32,.025,'sine');
 }
-function darkRingRadius(n){ return MEASURE.ringScale*Math.sqrt(n*sampleLambda/MEASURE.referenceLambda); }
-function brightRingRadius(n){ return MEASURE.ringScale*Math.sqrt((n+0.5)*sampleLambda/MEASURE.referenceLambda); }
+function darkRingRadius(n){ return MEASURE.ringScale*Math.sqrt(n*SOURCE_LAMBDA/MEASURE.referenceLambda); }
+function brightRingRadius(n){ return MEASURE.ringScale*Math.sqrt((n+0.5)*SOURCE_LAMBDA/MEASURE.referenceLambda); }
 function measurementTargets(){
   const ri=darkRingRadius(MEASURE.i), rk=darkRingRadius(MEASURE.k);
   return {ri,rk,K:MEASURE.cx-rk,I:MEASURE.cx+ri,Kp:MEASURE.cx+rk};
@@ -545,13 +551,13 @@ function finishComplete(){
 function resetTransientState(){
   activeCheckpoint=0;
   elapsed=0; completeTimer=0; deathTimer=0; hintTimer=0; screenPulse=.4; checkpointFlash=0;
-  lensTransitionTimer=0; sampleLambda=532; sampleIntensity=intensityFor(532);
+  lensTransitionTimer=0; samplePhase=Math.PI/2; sampleIntensity=intensityForPhase(samplePhase);
   measurementIntroTimer=0; measurementResultTimer=0; measurementStep=0; reticleX=MEASURE.cx; reticleVX=0;
   shotPulse=0; missTimer=0; missCountForStep=0; fringeHintTimer=0; lockFeedbackTimer=0; lockFeedbackText=''; measurementMarkers.length=0;
-  player.x=150; player.y=780-player.h; player.vx=0; player.vy=0; player.lambda=532; player.grounded=false; player.groundedOn=null; player.jumpBuffer=0; player.coyote=0;
-  player.respawnX=150; player.respawnFeet=780; player.respawnLambda=532;
+  player.x=150; player.y=780-player.h; player.vx=0; player.vy=0; player.phase=Math.PI/2; player.grounded=false; player.groundedOn=null; player.jumpBuffer=0; player.coyote=0;
+  player.respawnX=150; player.respawnFeet=780; player.respawnPhase=Math.PI/2;
   player.ghost.clear(); player.trail.length=0;
-  player.intensity=intensityFor(player.lambda); player.state=stateFor(player.intensity);
+  player.intensity=intensityForPhase(player.phase); player.state=stateFor(player.intensity);
   camera.x=0; camera.y=235; camera.zoom=1; camera.targetZoom=1;
   pressed.clear(); keys.clear();
 }
@@ -622,10 +628,11 @@ function update(dt){
     completeTimer+=dt; updateAudio(); pressed.clear(); return;
   }
 
-  // PLAY: continuous wavelength tuning remains independent from movement keys.
+  // PLAY: relative phase tuning is CYCLIC. There are no endpoints.
+  // Holding either arrow keeps sliding Wave B forever: BRIGHT -> TUNING -> DARK -> TUNING -> BRIGHT -> ...
   tuneDir=(keys.has('ArrowRight')?1:0)-(keys.has('ArrowLeft')?1:0);
-  if(tuneDir) player.lambda=clamp(player.lambda+tuneDir*CFG.tuneSpeed*dt,450,650);
-  player.intensity=intensityFor(player.lambda);
+  if(tuneDir) player.phase=wrapPhase(player.phase+tuneDir*CFG.phaseSpeed*dt);
+  player.intensity=intensityForPhase(player.phase);
   player.state=stateFor(player.intensity);
 
   const move=(keys.has('KeyD')?1:0)-(keys.has('KeyA')?1:0);
@@ -761,32 +768,37 @@ function drawTerrain(c){
   const [a,b]=materialBase(c);
 
   ctx.save();
-  let alpha=1;
-  if(full) alpha=.60 + .10*(1-local);
-  ctx.globalAlpha=alpha;
+  // IMPORTANT: matching a material must never dim, tint, or recolor its base surface.
+  // Collision state changes, but WHITE stays white, GRAY stays gray, and BLACK stays black.
+  ctx.globalAlpha=1;
   const grad=ctx.createLinearGradient(x,y,x,y+h);
   grad.addColorStop(0,a); grad.addColorStop(1,b); ctx.fillStyle=grad;
   ctx.fillRect(x,y,w,h);
 
+  // Keep each material's normal texture completely stable regardless of match state.
   if(c.material===MAT.WHITE){
-    ctx.globalAlpha=alpha*(.18+.22*react); ctx.fillStyle='#fff';
+    ctx.globalAlpha=.18; ctx.fillStyle='#fff';
     for(let px=x+12;px<x+w;px+=34){ const py=y+8+((px*.37)%Math.max(12,h-12)); ctx.fillRect(px,py,1.5,1.5); }
-    ctx.globalAlpha=alpha*.65; ctx.strokeStyle='#f8ffff'; ctx.lineWidth=1.5; ctx.strokeRect(x+.75,y+.75,w-1.5,h-1.5);
+    ctx.globalAlpha=.65; ctx.strokeStyle='#f8ffff'; ctx.lineWidth=1.5; ctx.strokeRect(x+.75,y+.75,w-1.5,h-1.5);
   } else if(c.material===MAT.GRAY){
-    ctx.globalAlpha=alpha*(.14+.24*react); ctx.strokeStyle='#d9e0e7'; ctx.lineWidth=1;
+    ctx.globalAlpha=.14; ctx.strokeStyle='#d9e0e7'; ctx.lineWidth=1;
     const step=24; for(let d=-h;d<w;d+=step){ctx.beginPath();ctx.moveTo(x+d,y+h);ctx.lineTo(x+d+h,y);ctx.stroke();}
-    ctx.globalAlpha=alpha*.4; ctx.strokeStyle='#c4ccd5'; ctx.strokeRect(x+.5,y+.5,w-1,h-1);
+    ctx.globalAlpha=.4; ctx.strokeStyle='#c4ccd5'; ctx.strokeRect(x+.5,y+.5,w-1,h-1);
   } else {
-    ctx.globalAlpha=alpha*(.22+.38*react); ctx.strokeStyle=react>.05?'rgba(220,230,236,.72)':'#526173'; ctx.lineWidth=1.2+react*1.8; ctx.strokeRect(x+1,y+1,w-2,h-2);
-    ctx.globalAlpha=alpha*.11; ctx.fillStyle='#8fa0b2';
+    ctx.globalAlpha=.22; ctx.strokeStyle='#526173'; ctx.lineWidth=1.2; ctx.strokeRect(x+1,y+1,w-2,h-2);
+    ctx.globalAlpha=.11; ctx.fillStyle='#8fa0b2';
     for(let px=x+15;px<x+w;px+=43) ctx.fillRect(px,y+Math.abs(Math.sin(px*.13))*Math.max(2,h-3),7,1);
   }
 
+  // Match feedback is now an additive outline/ripple overlay only.
+  // It never changes the material's fill alpha, hue, or brightness.
   if(react>0){
-    ctx.globalAlpha=.18+.28*react;
-    ctx.strokeStyle='rgba(238,244,247,.90)'; ctx.lineWidth=1+2*react;
-    const wave=(Math.sin(elapsed*7+c.id)*3)*react;
-    ctx.strokeRect(x+3+wave,y+3,w-6-wave*2,h-6);
+    const pulse=.5+.5*Math.sin(elapsed*7+c.id);
+    ctx.globalAlpha=(.10+.16*react)*(.72+.28*pulse);
+    ctx.strokeStyle='rgba(238,244,247,1)';
+    ctx.lineWidth=.8+1.4*react;
+    const inset=3+2*pulse*react;
+    ctx.strokeRect(x+inset,y+inset,Math.max(0,w-inset*2),Math.max(0,h-inset*2));
   }
   ctx.restore();
 }
@@ -849,22 +861,26 @@ function drawTrail(){
 
 function drawPlayer(){
   const x=worldToScreenX(player.x), y=worldToScreenY(player.y), w=player.w*camera.zoom,h=player.h*camera.zoom;
-  const cx=x+w/2, I=player.intensity;
-  const glow=5+I*34;
+  const cx=x+w/2, state=player.state;
+  const visual = state==='BRIGHT'
+    ? { body:'#f3f6f8', stroke:'#ffffff', glow:32, glowAlpha:.82, core:true }
+    : state==='DARK'
+      ? { body:'#0c1014', stroke:'#d9e1e6', glow:6, glowAlpha:.18, core:false }
+      : { body:'#707980', stroke:'#d5dde2', glow:14, glowAlpha:.36, core:false };
   ctx.save();
-  ctx.shadowBlur=glow; ctx.shadowColor=`rgba(255,255,255,${.20+.62*I})`;
+  ctx.shadowBlur=visual.glow; ctx.shadowColor=`rgba(255,255,255,${visual.glowAlpha})`;
 
-  // Monochrome aura: interference changes luminance only.
-  ctx.globalAlpha=.06+.28*I;
-  const rg=ctx.createRadialGradient(cx,y+h*.48,2,cx,y+h*.48,34+I*18);
-  rg.addColorStop(0,`rgba(255,255,255,${.22+.58*I})`); rg.addColorStop(1,'rgba(255,255,255,0)');
-  ctx.fillStyle=rg; ctx.beginPath();ctx.arc(cx,y+h*.48,42+I*12,0,Math.PI*2);ctx.fill();
+  // State color snaps cleanly at the band boundary: bright / tuning / dark.
+  ctx.globalAlpha=state==='DARK' ? .10 : state==='BRIGHT' ? .34 : .18;
+  const radius=state==='BRIGHT' ? 54 : state==='DARK' ? 32 : 42;
+  const rg=ctx.createRadialGradient(cx,y+h*.48,2,cx,y+h*.48,radius);
+  rg.addColorStop(0, state==='BRIGHT' ? 'rgba(255,255,255,.82)' : state==='DARK' ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.38)');
+  rg.addColorStop(1,'rgba(255,255,255,0)');
+  ctx.fillStyle=rg; ctx.beginPath();ctx.arc(cx,y+h*.48,radius,0,Math.PI*2);ctx.fill();
 
-  // Body brightness follows normalized interference intensity.
-  const bodyV=Math.round(lerp(18,246,I));
-  ctx.globalAlpha=1; ctx.fillStyle=`rgb(${bodyV},${bodyV},${bodyV})`;
-  ctx.strokeStyle=I<.28?'#dce4e8':I>.76?'#ffffff':'#c5cdd2';
-  ctx.lineWidth=I<.28?2.3:1.3;
+  ctx.globalAlpha=1; ctx.fillStyle=visual.body;
+  ctx.strokeStyle=visual.stroke;
+  ctx.lineWidth=state==='DARK'?2.3:state==='BRIGHT'?1.4:1.7;
 
   // abstract humanoid/light-being silhouette
   ctx.beginPath(); ctx.arc(cx,y+12,9,0,Math.PI*2); ctx.fill(); ctx.stroke();
@@ -874,8 +890,8 @@ function drawPlayer(){
   ctx.lineWidth=7;
   ctx.beginPath();ctx.moveTo(cx-5,y+45);ctx.lineTo(cx-10,y+61);ctx.moveTo(cx+5,y+45);ctx.lineTo(cx+10,y+61);ctx.stroke();
 
-  if(I>.76){
-    ctx.globalAlpha=(I-.76)/.24*.86; ctx.fillStyle='#fff'; ctx.shadowBlur=24; ctx.shadowColor='#fff';
+  if(visual.core){
+    ctx.globalAlpha=.86; ctx.fillStyle='#fff'; ctx.shadowBlur=24; ctx.shadowColor='#fff';
     ctx.beginPath();ctx.arc(cx,y+12,4.2,0,Math.PI*2);ctx.fill();
   }
   ctx.restore();
@@ -888,12 +904,12 @@ function drawDebug(){
     for(const c of terrain){ if(!onScreen(c,20)) continue; const x=worldToScreenX(c.x),y=worldToScreenY(c.y),w=c.w*camera.zoom,h=c.h*camera.zoom; ctx.strokeStyle=c.material===MAT.WHITE?'#fff':c.material===MAT.GRAY?'#bbb':'#ff6'; ctx.strokeRect(x,y,w,h); ctx.fillStyle='rgba(0,0,0,.72)';ctx.fillRect(x,y-17,Math.min(190,8+c.name.length*7),16);ctx.fillStyle='#fff';ctx.font='11px monospace';ctx.fillText(c.name,x+4,y-5); }
     const px=worldToScreenX(player.x),py=worldToScreenY(player.y);ctx.strokeStyle='#00ffff';ctx.strokeRect(px,py,player.w*camera.zoom,player.h*camera.zoom);
     ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(18,132,390,176);ctx.fillStyle='#9ff';ctx.font='14px monospace';
-    const lines=[`DEBUG [H]`,`level: ${selectedLevel}`,`mode: ${gameState}`,`lambda: ${player.lambda.toFixed(2)} nm`,`I: ${player.intensity.toFixed(4)}`,`state: ${player.state}`,`pos: ${player.x.toFixed(1)}, ${player.y.toFixed(1)}`,`vel: ${player.vx.toFixed(1)}, ${player.vy.toFixed(1)}`,`grounded: ${player.grounded} on ${player.groundedOn??'-'}`,`checkpoint: ${activeCheckpoint}`,`sampleLambda: ${sampleLambda.toFixed(2)}`];
+    const lines=[`DEBUG [H]`,`level: ${selectedLevel}`,`mode: ${gameState}`,`phase: ${(wrapPhase(player.phase)*180/Math.PI).toFixed(1)}°`,`I: ${player.intensity.toFixed(4)}`,`state: ${player.state}`,`pos: ${player.x.toFixed(1)}, ${player.y.toFixed(1)}`,`vel: ${player.vx.toFixed(1)}, ${player.vy.toFixed(1)}`,`grounded: ${player.grounded} on ${player.groundedOn??'-'}`,`checkpoint: ${activeCheckpoint}`,`samplePhase: ${(samplePhase*180/Math.PI).toFixed(1)}°`];
     lines.forEach((t,i)=>ctx.fillText(t,30,155+i*16));
   } else {
     const t=measurementTargets();
     ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(18,132,420,210);ctx.fillStyle='#9ff';ctx.font='14px monospace';
-    const lines=[`DEBUG [H]`,`level: ${selectedLevel}`,`mode: ${gameState}`,`sampleLambda: ${sampleLambda.toFixed(2)} nm`,`sampleI: ${sampleIntensity.toFixed(4)}`,`ri: ${t.ri.toFixed(2)} px`,`rk: ${t.rk.toFixed(2)} px`,`K x: ${t.K.toFixed(2)}`,`I x: ${t.I.toFixed(2)}`,`K' x: ${t.Kp.toFixed(2)}`,`reticleX: ${reticleX.toFixed(2)}`,`step: ${measurementStep}`,`tolerance: ±${MEASURE.tolerance} px`];
+    const lines=[`DEBUG [H]`,`level: ${selectedLevel}`,`mode: ${gameState}`,`source lambda: ${SOURCE_LAMBDA} nm`,`sample phase: ${(samplePhase*180/Math.PI).toFixed(1)}°`,`sampleI: ${sampleIntensity.toFixed(4)}`,`ri: ${t.ri.toFixed(2)} px`,`rk: ${t.rk.toFixed(2)} px`,`K x: ${t.K.toFixed(2)}`,`I x: ${t.I.toFixed(2)}`,`K' x: ${t.Kp.toFixed(2)}`,`reticleX: ${reticleX.toFixed(2)}`,`step: ${measurementStep}`,`tolerance: ±${MEASURE.tolerance} px`];
     lines.forEach((v,i)=>ctx.fillText(v,30,155+i*16));
   }
   ctx.restore();
@@ -906,23 +922,23 @@ function drawControlHint(){
 }
 
 function drawTuner(){
-  // Wave-first tuner: the waves are the primary readout; the wavelength bar is intentionally secondary.
-  const W=520,H=146,x=(V.w-W)/2,y=V.h-H-18;
+  // Wave-first cyclic phase tuner. Wave A is fixed; Wave B slides forever with no endpoints.
+  const W=500,H=142,x=(V.w-W)/2,y=V.h-H-18;
   ctx.save();
   ctx.fillStyle='rgba(5,9,17,.88)'; rr(x,y,W,H,17);ctx.fill();
   ctx.strokeStyle='rgba(205,220,230,.18)';ctx.lineWidth=1;ctx.stroke();
 
   ctx.fillStyle='rgba(225,234,239,.56)';ctx.font='700 9px ui-sans-serif,system-ui';ctx.textAlign='left';
-  ctx.fillText('INTERFERENCE TUNER',x+22,y+20);
+  ctx.fillText('INTERFERENCE · PHASE LOOP',x+20,y+19);
 
-  const wx=x+66, ww=300;
-  const yA=y+50, yB=y+88;
-  const phase=(2*Math.PI*731.25/player.lambda)+(0.75*Math.PI);
+  const wx=x+64, ww=292;
+  const yA=y+48, yB=y+84;
   const spatial=.082;
+  const phase=wrapPhase(player.phase);
 
-  // faint alignment guides make phase alignment readable without turning the panel into a graph.
-  ctx.strokeStyle='rgba(190,205,215,.08)';ctx.lineWidth=1;
-  for(let gx=wx;gx<=wx+ww;gx+=50){ctx.beginPath();ctx.moveTo(gx,y+31);ctx.lineTo(gx,y+104);ctx.stroke();}
+  // Faint alignment guides help the eye compare crests/troughs directly.
+  ctx.strokeStyle='rgba(190,205,215,.07)';ctx.lineWidth=1;
+  for(let gx=wx;gx<=wx+ww;gx+=49){ctx.beginPath();ctx.moveTo(gx,y+30);ctx.lineTo(gx,y+101);ctx.stroke();}
 
   function waveRow(baseY, offset, stroke, width=2){
     ctx.strokeStyle=stroke;ctx.lineWidth=width;ctx.beginPath();
@@ -931,32 +947,50 @@ function drawTuner(){
 
   ctx.fillStyle='rgba(225,234,239,.52)';ctx.font='700 9px ui-sans-serif,system-ui';ctx.textAlign='right';
   ctx.fillText('A',wx-18,yA+3);ctx.fillText('B',wx-18,yB+3);
-  ctx.font='600 8px ui-sans-serif,system-ui';ctx.fillStyle='rgba(225,234,239,.32)';ctx.fillText('FIXED',wx-18,yA+15);ctx.fillText('TUNED',wx-18,yB+15);
+  ctx.font='600 8px ui-sans-serif,system-ui';ctx.fillStyle='rgba(225,234,239,.30)';ctx.fillText('FIXED',wx-18,yA+15);ctx.fillText('SHIFT',wx-18,yB+15);
 
-  waveRow(yA,0,'rgba(246,249,250,.92)',2.1);
-  waveRow(yB,phase,'rgba(157,171,181,.96)',2.1);
+  waveRow(yA,0,'rgba(246,249,250,.94)',2.1);
+  waveRow(yB,phase,'rgba(157,171,181,.98)',2.1);
 
-  // Compact state readout. It supports the wave view, but is not the main control target.
+  // Compact status only; the waveform alignment remains the primary readout.
   const sv=stateVisual();
-  const sx=x+392, sy=y+36, sw=105, sh=64;
-  ctx.shadowBlur=player.state==='BRIGHT'?14:4;ctx.shadowColor='rgba(255,255,255,.34)';
+  const sx=x+378, sy=y+34, sw=100, sh=62;
+  ctx.shadowBlur=player.state==='BRIGHT'?14:player.state==='DARK'?3:7;ctx.shadowColor='rgba(255,255,255,.30)';
   ctx.fillStyle=sv.fill;rr(sx,sy,sw,sh,14);ctx.fill();ctx.shadowBlur=0;
-  ctx.strokeStyle=sv.edge;ctx.globalAlpha=.68;ctx.stroke();ctx.globalAlpha=1;
-  ctx.fillStyle=sv.text;ctx.textAlign='center';ctx.font='800 15px ui-sans-serif,system-ui';ctx.fillText(sv.label,sx+sw/2,sy+28);
-  ctx.font='700 8px ui-sans-serif,system-ui';ctx.globalAlpha=.68;ctx.fillText(sv.relation,sx+sw/2,sy+46);ctx.globalAlpha=1;
+  ctx.strokeStyle=sv.edge;ctx.globalAlpha=.66;ctx.stroke();ctx.globalAlpha=1;
+  ctx.fillStyle=sv.text;ctx.textAlign='center';ctx.font='800 14px ui-sans-serif,system-ui';ctx.fillText(sv.label,sx+sw/2,sy+27);
+  ctx.font='700 7.5px ui-sans-serif,system-ui';ctx.globalAlpha=.68;ctx.fillText(sv.relation,sx+sw/2,sy+45);ctx.globalAlpha=1;
 
-  // Small wavelength bar: retained as a secondary reference only.
-  const bx=x+105, by=y+121, bw=210,bh=7;
-  const grad=ctx.createLinearGradient(bx,0,bx+bw,0);
-  grad.addColorStop(0,'#f2f4f5');grad.addColorStop(.5,'#7b838a');grad.addColorStop(1,'#11161b');
-  ctx.fillStyle=grad;rr(bx,by,bw,bh,4);ctx.fill();
-  ctx.strokeStyle='rgba(235,241,244,.18)';ctx.lineWidth=1;ctx.stroke();
-  const pos=bx+((player.lambda-450)/200)*bw;
-  ctx.strokeStyle='#f7fafb';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(pos,by-4);ctx.lineTo(pos,by+bh+4);ctx.stroke();
-  ctx.fillStyle='rgba(225,234,239,.52)';ctx.font='600 9px ui-monospace,monospace';ctx.textAlign='left';ctx.fillText('450',bx-2,by+21);ctx.textAlign='right';ctx.fillText('650 nm',bx+bw+2,by+21);
-  ctx.textAlign='center';ctx.fillStyle='rgba(235,241,244,.72)';ctx.fillText(`λ ${player.lambda.toFixed(0)} nm`,bx+bw/2,by+21);
+  // Tiny cyclic strip with HARD phase boundaries and no endpoints.
+  // Important: this strip is derived from the SAME phase->intensity->state logic as gameplay,
+  // so the state under the marker always matches the actual player state.
+  const bx=x+112, by=y+114, bw=210,bh=12;
+  const marker=bx+bw/2;
+  const pxPerCycle=112;
+  function stateFill(s){ return s==='BRIGHT' ? '#f2f5f7' : s==='DARK' ? '#0c1014' : '#747c82'; }
+  for(let ix=0; ix<bw; ix++){
+    const localPhase = wrapPhase(player.phase + ((ix + 0.5 - bw/2) / pxPerCycle) * TAU);
+    const localState = stateFor(intensityForPhase(localPhase));
+    ctx.fillStyle = stateFill(localState);
+    ctx.fillRect(bx+ix, by, 1, bh);
+  }
+  // Draw crisp boundaries between state bands for readability.
+  let prevState = null;
+  for(let ix=0; ix<=bw; ix++){
+    const probePhase = wrapPhase(player.phase + ((ix - bw/2) / pxPerCycle) * TAU);
+    const s = stateFor(intensityForPhase(probePhase));
+    if(ix>0 && s!==prevState){
+      const lx=bx+ix;
+      ctx.strokeStyle='rgba(235,241,244,.14)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(lx+.5,by); ctx.lineTo(lx+.5,by+bh); ctx.stroke();
+    }
+    prevState = s;
+  }
+  ctx.strokeStyle='rgba(235,241,244,.18)';ctx.lineWidth=1;ctx.strokeRect(bx,by,bw,bh);
+  ctx.strokeStyle='#f7fafb';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(marker,by-4);ctx.lineTo(marker,by+bh+4);ctx.stroke();
+  ctx.fillStyle='rgba(225,234,239,.40)';ctx.font='600 8px ui-sans-serif,system-ui';ctx.textAlign='center';ctx.fillText('BRIGHT  ·  TUNING  ·  DARK  ·  TUNING  ·  LOOP',bx+bw/2,by+24);
 
-  ctx.textAlign='left';ctx.fillStyle='rgba(225,234,239,.38)';ctx.font='650 9px ui-sans-serif,system-ui';ctx.fillText('← / →  SHIFT WAVE B',x+385,y+123);
+  ctx.textAlign='left';ctx.fillStyle='rgba(225,234,239,.40)';ctx.font='650 9px ui-sans-serif,system-ui';ctx.fillText('← / →  SLIDE WAVE B  ·  NO ENDPOINTS',x+338,y+122);
   ctx.restore();
 }
 
@@ -984,14 +1018,14 @@ function drawLensTransitionOverlay(){
   ctx.save();
   // Early lock acknowledgement.
   const lockA=clamp(1-Math.max(0,t-.55)/.35,0,1);
-  if(t<.9){ctx.globalAlpha=.9*lockA;ctx.textAlign='center';ctx.fillStyle='#edf4f7';ctx.font='700 15px ui-sans-serif,system-ui';ctx.fillText('LIGHT SAMPLE LOCKED',800,165);ctx.font='500 11px ui-monospace,monospace';ctx.globalAlpha=.58*lockA;ctx.fillText(`${sampleLambda.toFixed(1)} nm  ·  I ${sampleIntensity.toFixed(2)}`,800,187);}
+  if(t<.9){ctx.globalAlpha=.9*lockA;ctx.textAlign='center';ctx.fillStyle='#edf4f7';ctx.font='700 15px ui-sans-serif,system-ui';ctx.fillText('LIGHT SAMPLE LOCKED',800,165);ctx.font='500 11px ui-monospace,monospace';ctx.globalAlpha=.58*lockA;ctx.fillText(`φ ${(samplePhase*180/Math.PI).toFixed(0)}°  ·  I ${sampleIntensity.toFixed(2)}  ·  λ ${SOURCE_LAMBDA} nm`,800,187);}
 
   // Two coherent waveform traces leave the tuner and converge on the lens.
   if(t>.35&&t<1.35){
     const a=clamp((t-.35)/.22,0,1)*clamp((1.35-t)/.3,0,1);
     ctx.globalAlpha=.52*a;ctx.lineWidth=1.7;
     const startX=800,startY=785;
-    const phase=(2*Math.PI*731.25/sampleLambda)+(0.75*Math.PI);
+    const phase=samplePhase;
     for(let wv=0;wv<2;wv++){
       ctx.strokeStyle=wv===0?'#f1f5f6':'#9da8af';ctx.setLineDash(wv?[7,5]:[]);ctx.beginPath();
       for(let j=0;j<=70;j++){
@@ -1152,7 +1186,7 @@ function drawLevelSelect(){
   ctx.fillStyle='rgba(220,232,240,.55)';ctx.font='600 13px ui-sans-serif,system-ui';ctx.fillText('SELECT PROTOTYPE LEVEL',800,205);
 
   const cards=[
-    {x:285,y:350,w:490,h:260,title:'EASY / MEDIUM',sub:'Learn the flow + Newton measurement',details:['Forgiving platform route','Bright · Medium · Dark','Ends with K · I · K\' measurement']},
+    {x:285,y:350,w:490,h:260,title:'EASY / MEDIUM',sub:'Learn the flow + Newton measurement',details:['Forgiving platform route','Bright · Tuning · Dark','Ends with K · I · K\' measurement']},
     {x:825,y:350,w:490,h:260,title:'HARD',sub:'Advanced platform challenge',details:['Original hard prototype','Mid-air tuning + recovery','Higher execution difficulty']}
   ];
   cards.forEach((c,i)=>{
@@ -1227,7 +1261,7 @@ function frame(now){
   while(acc>=STEP&&guard++<8){update(STEP);acc-=STEP;}
   draw();requestAnimationFrame(frame);
 }
-player.intensity=intensityFor(player.lambda);player.state=stateFor(player.intensity);
+player.intensity=intensityForPhase(player.phase);player.state=stateFor(player.intensity);
 requestAnimationFrame(frame);
 
 })();
