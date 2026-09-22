@@ -961,34 +961,56 @@ function drawTuner(){
   ctx.fillStyle=sv.text;ctx.textAlign='center';ctx.font='800 14px ui-sans-serif,system-ui';ctx.fillText(sv.label,sx+sw/2,sy+27);
   ctx.font='700 7.5px ui-sans-serif,system-ui';ctx.globalAlpha=.68;ctx.fillText(sv.relation,sx+sw/2,sy+45);ctx.globalAlpha=1;
 
-  // Tiny cyclic strip with HARD phase boundaries and no endpoints.
-  // Important: this strip is derived from the SAME phase->intensity->state logic as gameplay,
-  // so the state under the marker always matches the actual player state.
+  // Tiny cyclic strip with a continuous ombre that still makes the next dark/bright zone readable.
+  // It is derived from the SAME phase->intensity->state logic as gameplay,
+  // so the tone under the marker always matches the actual player state.
   const bx=x+112, by=y+114, bw=210,bh=12;
   const marker=bx+bw/2;
   const pxPerCycle=112;
-  function stateFill(s){ return s==='BRIGHT' ? '#f2f5f7' : s==='DARK' ? '#0c1014' : '#747c82'; }
+  function stripColorForPhase(localPhase){
+    const I=intensityForPhase(localPhase);
+    const s=stateFor(I);
+    // Ombre brightness from interference intensity.
+    let v=Math.round(18 + I*226);
+    let r=v, g=v, b=v;
+    // Make the tuning band read more clearly by tinting it slightly blue-gray and lifting it a bit.
+    if(s==='TUNING'){
+      r=Math.round(v*0.92 + 8);
+      g=Math.round(v*0.95 + 10);
+      b=Math.round(v*1.02 + 18);
+    }
+    // Give the extreme bands a cleaner feel.
+    if(s==='BRIGHT'){ r=Math.min(245,r+6); g=Math.min(247,g+6); b=Math.min(248,b+6); }
+    if(s==='DARK'){ r=Math.max(10,r-6); g=Math.max(12,g-6); b=Math.max(14,b-6); }
+    return `rgb(${r},${g},${b})`;
+  }
   for(let ix=0; ix<bw; ix++){
     const localPhase = wrapPhase(player.phase + ((ix + 0.5 - bw/2) / pxPerCycle) * TAU);
-    const localState = stateFor(intensityForPhase(localPhase));
-    ctx.fillStyle = stateFill(localState);
+    ctx.fillStyle = stripColorForPhase(localPhase);
     ctx.fillRect(bx+ix, by, 1, bh);
   }
-  // Draw crisp boundaries between state bands for readability.
+  // Keep soft state boundaries so it is easy to read what zone is about to turn dark or bright.
   let prevState = null;
   for(let ix=0; ix<=bw; ix++){
     const probePhase = wrapPhase(player.phase + ((ix - bw/2) / pxPerCycle) * TAU);
     const s = stateFor(intensityForPhase(probePhase));
     if(ix>0 && s!==prevState){
       const lx=bx+ix;
-      ctx.strokeStyle='rgba(235,241,244,.14)'; ctx.lineWidth=1;
-      ctx.beginPath(); ctx.moveTo(lx+.5,by); ctx.lineTo(lx+.5,by+bh); ctx.stroke();
+      ctx.strokeStyle='rgba(245,248,250,.22)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(lx+.5,by-1); ctx.lineTo(lx+.5,by+bh+1); ctx.stroke();
     }
     prevState = s;
   }
+  // A faint top sheen helps the ombre read as a strip instead of separate blocks.
+  const sheen=ctx.createLinearGradient(bx,by,bx,by+bh);
+  sheen.addColorStop(0,'rgba(255,255,255,.10)');
+  sheen.addColorStop(.55,'rgba(255,255,255,.02)');
+  sheen.addColorStop(1,'rgba(0,0,0,.12)');
+  ctx.fillStyle=sheen; ctx.fillRect(bx,by,bw,bh);
+
   ctx.strokeStyle='rgba(235,241,244,.18)';ctx.lineWidth=1;ctx.strokeRect(bx,by,bw,bh);
   ctx.strokeStyle='#f7fafb';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(marker,by-4);ctx.lineTo(marker,by+bh+4);ctx.stroke();
-  ctx.fillStyle='rgba(225,234,239,.40)';ctx.font='600 8px ui-sans-serif,system-ui';ctx.textAlign='center';ctx.fillText('BRIGHT  ·  TUNING  ·  DARK  ·  TUNING  ·  LOOP',bx+bw/2,by+24);
+  ctx.fillStyle='rgba(225,234,239,.42)';ctx.font='600 8px ui-sans-serif,system-ui';ctx.textAlign='center';ctx.fillText('BRIGHT  ·  TUNING  ·  DARK  ·  TUNING  ·  LOOP',bx+bw/2,by+24);
 
   ctx.textAlign='left';ctx.fillStyle='rgba(225,234,239,.40)';ctx.font='650 9px ui-sans-serif,system-ui';ctx.fillText('← / →  SLIDE WAVE B  ·  NO ENDPOINTS',x+338,y+122);
   ctx.restore();
